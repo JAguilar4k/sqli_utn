@@ -1,26 +1,36 @@
 """
 =============================================================
-  SQL INJECTION VULNERABLE LAB  –  ISW-1013 Calidad del Software
+  SQL INJECTION SECURE LAB  –  ISW-1013 Calidad del Software
   Universidad Técnica Nacional
 =============================================================
 
-  ⚠️  ESTE ARCHIVO CONTIENE VULNERABILIDADES INTENCIONALES ⚠️
-  Uso exclusivo para laboratorio académico local.
-  No exponer a Internet ni usar fuera de entorno controlado.
+  ✅  VERSIÓN CORREGIDA — todas las vulnerabilidades han sido
+  mitigadas. Los comentarios FIX-XX indican qué cambio
+  corresponde a cada vulnerabilidad original.
 
-  Vulnerabilidades presentes (para que los estudiantes las encuentren):
-    V-01  SQL Injection en login (concatenación directa)
-    V-02  SQL Injection en búsqueda (concatenación directa)
-    V-03  Contraseñas en texto plano (sin hashing)
-    V-04  SECRET_KEY hardcodeada en el código fuente
-    V-05  Modo debug=True activo (expone debugger interactivo)
-    V-06  Exposición de la consulta SQL cruda en la interfaz
-    V-07  Enlace "Admin" visible para todos los roles en la navegación
-    V-08  Sin protección CSRF en formularios
+  Correcciones aplicadas:
+    FIX-01  Consultas parametrizadas en login (sin concatenación)
+    FIX-02  Consultas parametrizadas en búsqueda (sin concatenación)
+    FIX-03  Contraseñas hasheadas con Werkzeug (PBKDF2-SHA256)
+    FIX-04  SECRET_KEY cargada desde variable de entorno
+    FIX-05  debug=False en producción; controlado por variable de entorno
+    FIX-06  Consulta SQL cruda eliminada de la interfaz
+    FIX-07  Enlace "Admin" restringido a rol admin en templates
+    FIX-08  Protección CSRF con Flask-WTF
+
+  Dependencias necesarias:
+    pip install flask flask-wtf werkzeug
+
+  Variables de entorno requeridas antes de ejecutar:
+    export SECRET_KEY="reemplaza-con-una-clave-aleatoria-segura"
+    export FLASK_DEBUG=0   # usar 1 solo en desarrollo local
 =============================================================
 """
 
+import os
 from flask import Flask, render_template, request, redirect, url_for, session, flash
+from flask_wtf import CSRFProtect                                            # FIX-08
+from werkzeug.security import generate_password_hash, check_password_hash   # FIX-03
 import sqlite3
 from pathlib import Path
 
@@ -30,11 +40,28 @@ DB_PATH  = BASE_DIR / "db" / "lab.db"
 app = Flask(__name__)
 
 # ---------------------------------------------------------------
-# V-04: SECRET_KEY hardcodeada en el código fuente.
-# En una aplicación real debe cargarse desde una variable de
-# entorno y nunca commitearse al repositorio.
+# FIX-04: SECRET_KEY cargada desde variable de entorno.
+# Nunca debe hardcodearse en el código fuente ni commitearse
+# al repositorio. Si la variable no existe, se lanza un error
+# claro para forzar una configuración explícita.
 # ---------------------------------------------------------------
-app.config["SECRET_KEY"] = "dev-secret-key-insegura-1234"
+secret_key = os.environ.get("SECRET_KEY")
+if not secret_key:
+    raise RuntimeError(
+        "La variable de entorno SECRET_KEY no está definida. "
+        "Ejecútala con: export SECRET_KEY='<clave-aleatoria-segura>'"
+    )
+app.config["SECRET_KEY"] = secret_key
+
+# ---------------------------------------------------------------
+# FIX-08: Protección CSRF activada globalmente con Flask-WTF.
+# Genera un token único por sesión que se valida en cada POST.
+# Los templates deben incluir dentro de cada <form>:
+#   {{ form.hidden_tag() }}
+#   — o manualmente —
+#   <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+# ---------------------------------------------------------------
+csrf = CSRFProtect(app)
 
 
 # ---------------------------------------------------------------
@@ -82,16 +109,16 @@ def init_db():
     """)
 
     # -------------------------------------------------------
-    # V-03: Contraseñas almacenadas en TEXTO PLANO.
-    # Nunca deben almacenarse así en una aplicación real.
-    # Deben usarse bcrypt, Argon2 o PBKDF2.
+    # FIX-03: Contraseñas hasheadas con PBKDF2-SHA256
+    # mediante werkzeug.security.generate_password_hash.
+    # Nunca se almacena la contraseña en texto plano.
     # -------------------------------------------------------
     cur.execute("SELECT COUNT(*) FROM users")
     if cur.fetchone()[0] == 0:
         users = [
-            ("admin",   "Admin123",   "admin"),
-            ("analyst", "Analyst123", "user"),
-            ("student", "Student123", "user"),
+            ("admin",   generate_password_hash("Admin123"),   "admin"),
+            ("analyst", generate_password_hash("Analyst123"), "user"),
+            ("student", generate_password_hash("Student123"), "user"),
         ]
         cur.executemany(
             "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
@@ -148,35 +175,34 @@ def login():
         password = request.form.get("password", "")
 
         # ---------------------------------------------------
-        # V-01: SQL INJECTION EN LOGIN
-        # La consulta se construye concatenando directamente
-        # el input del usuario sin ningún tipo de validación.
+        # FIX-01: Consulta parametrizada en login.
+        # El username se pasa como parámetro (?) separado de
+        # la instrucción SQL. SQLite nunca lo interpreta como
+        # código, por lo que payloads como:
+        #   admin' --
+        #   ' OR '1'='1' --
+        # son tratados como texto literal y no surten efecto.
         #
-        # Payload de ejemplo que omite la contraseña:
-        #   usuario:  admin' --
-        #   password: (cualquier cosa)
-        #
-        # Payload que accede sin conocer ningún usuario:
-        #   usuario:  ' OR '1'='1' --
-        #   password: (cualquier cosa)
+        # La columna password se incluye en el SELECT para
+        # poder verificar el hash en Python (FIX-03).
         # ---------------------------------------------------
-        # V-01: Consulta vulnerable en UNA SOLA LÍNEA para que el comentario
-        # SQL (--) funcione correctamente en SQLite y el payload surta efecto.
-        # Payload de ejemplo: usuario = admin' --  / password = (cualquier cosa)
-        query = f"SELECT id, username, role FROM users WHERE username = '{username}' AND password = '{password}'"
+        query = "SELECT id, username, password, role FROM users WHERE username = ?"
 
         conn = get_connection()
         try:
-            user = conn.execute(query).fetchone()
+            user = conn.execute(query, (username,)).fetchone()
         except Exception as e:
-            # El error de SQLite se muestra directamente — también
-            # es información sensible que no debe exponerse.
-            flash(f"Error en la base de datos: {e}", "error")
+            # FIX-06 (parcial): el error interno no se expone
+            # al usuario; se registra solo en el log del servidor.
+            app.logger.error("Error de BD en login: %s", e)
+            flash("Error interno. Intente más tarde.", "error")
             conn.close()
-            return render_template("login.html", last_query=query)
+            return render_template("login.html")
         conn.close()
 
-        if user:
+        # FIX-03: la contraseña se verifica comparando el input
+        # contra el hash almacenado, nunca en texto plano.
+        if user and check_password_hash(user["password"], password):
             session["user_id"]  = user["id"]
             session["username"] = user["username"]
             session["role"]     = user["role"]
@@ -184,7 +210,7 @@ def login():
             flash("Inicio de sesión exitoso.", "success")
             return redirect(url_for("dashboard"))
 
-        log_event("LOGIN_FAIL", username, f"query={query}")
+        log_event("LOGIN_FAIL", username)
         flash("Credenciales incorrectas.", "error")
 
     return render_template("login.html")
@@ -208,37 +234,40 @@ def search():
         flash("Debe iniciar sesión primero.", "error")
         return redirect(url_for("login"))
 
-    books     = []
-    raw_query = None
+    books = []
 
     if request.method == "POST":
         term = request.form.get("term", "")
 
         # ---------------------------------------------------
-        # V-02: SQL INJECTION EN BÚSQUEDA
-        # El término de búsqueda se inserta directamente en
-        # la consulta con LIKE.
+        # FIX-02: Consulta parametrizada en búsqueda.
+        # El valor con comodines se construye en Python y se
+        # pasa como parámetro (?). SQLite lo escapa de forma
+        # automática; no puede alterar la lógica de la consulta.
         #
-        # Payload para extraer todos los usuarios:
+        # Payloads como:
         #   %' UNION SELECT id, username, password, role FROM users --
-        #
-        # Payload para verificar número de columnas:
-        #   %' UNION SELECT 1,2,3,4 --
+        # son tratados como texto literal sin efecto.
         # ---------------------------------------------------
-        # V-02: Búsqueda vulnerable también en una sola línea.
-        # Payload: %' UNION SELECT id, username, password, role FROM users --
-        raw_query = f"SELECT id, title, author, category FROM books WHERE title LIKE '%{term}%' OR author LIKE '%{term}%' OR category LIKE '%{term}%'"
+        query = (
+            "SELECT id, title, author, category FROM books "
+            "WHERE title LIKE ? OR author LIKE ? OR category LIKE ?"
+        )
+        like_term = f"%{term}%"
 
         conn = get_connection()
         try:
-            books = conn.execute(raw_query).fetchall()
+            books = conn.execute(query, (like_term, like_term, like_term)).fetchall()
         except Exception as e:
-            flash(f"Error en la base de datos: {e}", "error")
+            # FIX-06 (parcial): el error interno no se expone al usuario.
+            app.logger.error("Error de BD en búsqueda: %s", e)
+            flash("Error interno. Intente más tarde.", "error")
         conn.close()
 
-    # V-06: La consulta SQL cruda se pasa al template y se
-    # muestra en pantalla — expone la estructura interna de la BD.
-    return render_template("search.html", books=books, raw_query=raw_query)
+    # FIX-06: raw_query eliminada por completo.
+    # La consulta SQL interna nunca se pasa al template
+    # ni se muestra en la interfaz de usuario.
+    return render_template("search.html", books=books)
 
 
 @app.route("/admin")
@@ -253,12 +282,18 @@ def admin():
         return redirect(url_for("dashboard"))
 
     conn  = get_connection()
-    users = conn.execute("SELECT id, username, password, role FROM users ORDER BY id").fetchall()
+    # FIX-03: se excluye la columna password de la consulta;
+    # los hashes no deben mostrarse en ninguna interfaz.
+    users = conn.execute("SELECT id, username, role FROM users ORDER BY id").fetchall()
     logs  = conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 20").fetchall()
     conn.close()
 
-    # Nota: se incluye la columna password (texto plano) para que
-    # los estudiantes vean claramente la V-03 desde el panel admin.
+    # FIX-07: el enlace "Admin" en layout.html debe mostrarse
+    # únicamente cuando el usuario tiene rol admin.
+    # Ejemplo en Jinja2:
+    #   {% if session.get('role') == 'admin' %}
+    #     <a href="/admin">Admin</a>
+    #   {% endif %}
     return render_template("admin.html", users=users, logs=logs)
 
 
@@ -271,12 +306,15 @@ def logout():
 
 
 # ---------------------------------------------------------------
-# V-05: debug=True activo.
-# En modo debug, Flask activa un debugger interactivo en el
-# navegador cuando ocurre un error. Cualquier visitante puede
-# ejecutar código Python arbitrario en el servidor.
-# Nunca debe usarse debug=True en producción.
+# FIX-05: debug controlado por variable de entorno FLASK_DEBUG.
+# Por defecto es False (seguro para producción).
+# Solo se activa explícitamente en desarrollo con:
+#   export FLASK_DEBUG=1
+#
+# Con debug=False, Flask NO activa el debugger interactivo,
+# por lo que un error no permite ejecutar código en el servidor.
 # ---------------------------------------------------------------
 if __name__ == "__main__":
     init_db()
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    debug_mode = os.environ.get("FLASK_DEBUG", "0") == "1"
+    app.run(host="0.0.0.0", port=5000, debug=debug_mode)
